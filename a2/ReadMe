@@ -1,0 +1,158 @@
+Members in this group:
+Stephen Elmendorf
+Mengli Yuan
+
+
+1: Modifications to ensure unicast addresses are bound:
+	No modifications were needed to ensure only unicast addresses were bound.
+	This was ensured simply by not using the broadcast address field from the ifi_info structure.
+
+2: Array of structures for sockets:
+	We stored the interfaces in an array of structures with the following parameters:
+	Structure: server_interface
+		int 				fd;				/* socket file descriptor */
+		struct	sockaddr  	*ifi_addr;		/* primary address */
+		struct	sockaddr  	*ifi_ntmaddr;  	/* network mask address */
+		struct	sockaddr	*ifi_subaddr;	/* subnet mask address */
+
+3: Modifications of code in section 22.5
+	For our project we did not refer directly to the code in section 22.5.
+
+ A: RTT Calculation:
+	One change we made was the RTT calculations which are set to use integers rather
+	than floating point devision. We accomplish this by having the rttvar store a value
+	inflated by 4 times, and the srtt value inflated by 8 times. When needing to use these
+	values we then use the shift operator to obtain the correct value.
+	Note: we implemented the RTT calculations only on packets that had received less
+	than or equal to four ACKs. This means that if a packet was retransmitted, it's value
+	will not be used for the calculation in the ack.
+
+ B: RTT Header:
+	We rewote the RTT header to store the values that we thought important:
+		int	 	rtt;			/* most recent rtt in msec */
+		int 	srtt;			/* smoothed rtt in msec inflated by 8X */
+		int 	rttvar; 		/* variance inflated by 4X */
+		int 	rto;			/* current calculation to use in msec */
+		int 	windowPing;		/* how long until sending the next window ping in msec */
+
+ C: RTT Values:
+	The RTT values that we use are different than those in the book, namely:
+		RTT_RXTMIN		1000 			/* 1 second (in msec) */
+		RTT_RXTMAX		3000			/* 3 seconds (in msec) */
+		RTT_MAXNREXMT	12 				/* maximum amount of times to retransmit */
+
+	
+ D: Window:
+	We implemented the window as a linked list by using the following structure.
+	Structure: sent_packet
+		struct sent_packet 	*next;			/* pointer to the next packet */
+		struct header 		packet_header;	/* header of the packet */
+		char 				body[512];		/* body of the packet */
+		int 				acks;			/* used to store cumulative acks */
+		int 				times_sent;		/* used to store number of times sent */
+		unsigned long long int ts_msec; 	/* time that packet was sent in msec since epoch */
+
+	This window infrastructure enables us to manage the window easier, and by checking a counter
+	that stores the length and current capacity of the window, we ensure the window size is correct.
+
+ E: Timeouts:
+ 	The timeout mechanism we implemented is different from the book's in that our implementation
+ 	uses timeouts in the msec granularity rather than in the second granularity. This is implemented
+ 	in the RTT structure explained above, and executed using setitimer with the ITIMER_REAL flag.
+
+ F: Timeout Signals:
+ 	Our implementation of timeout signals was done without the use of siglongjmp on the client side. 
+ 	We were able to structure our client in such a way that no race condition would exist that would put the system into a deadlock if the alarm triggered elsewhere. On the server side, this was not possible,
+ 	so the use of siglongjmp was needed there to prevent race conditions.
+
+ G: Packet Header:
+ 	We implemented the packet header as a structure with the following values:
+ 		uint32_t  			seq_num;		/* this is really packet number */
+		uint32_t 			ack;			/* set to 1 to have ack flag on */
+		uint32_t 			fin;			/* fin flag - used to show last packet in transfer */
+		uint32_t 			receive_window;	/* the receive window space at this point */
+		uint32_t			size; 			/* size of the packet body */
+	This enabled us to easily perform memory copies in and out of buffers when sending or
+	receiving the packet. The total size of this packet is 20 bytes. This could be reduced by 
+	having one byte for Flags (ACK/FIN) and using shorts instead of longs. However, since
+	there were no restrictions on size, we opted for the unsigned long integers to improve flexibility.
+
+ H: Masking Alarms:
+ 	We implemented alarm masking with the use of SIG_BLOCK and SIG_UNBLOCK during the times when the
+ 	server is reading and sending a packet and during the packet reading and processing. 
+
+4: TCP Mechanisms:
+
+ A: Reliable data transmission::
+ 	We implemented reliable data transmission using ARQ sliding-windows, with Fast Retransmit. This was
+ 	accomplished with the linked list data structure for the window, outlined above, and the use of ACK's
+ 	from the client.
+  
+  -Timeouts: 
+ 	Upon reading data from the file, and when the window can be added to, the packet is made and added to 
+ 	the window. A timeout is set for the longest in-flight packet, which, upon triggering will resend this
+ 	first packet. This timeout was based on the RTO that was calculated with the RTT.
+  
+  -Processing ACKs:
+ 	Upon receiving an ACK for a packet, which may be cummulative, the server will remove all packets from 
+ 	the sending window up to, but not including, the sequence number ACKed back, as the client is still 
+ 	waiting for that number.
+  
+  -Fast Retransmit:
+ 	Furthermore, when an ACK is received, the packet for whom the pack was sent receives and updated ACK
+ 	counter. This counter is what is used in determining the fast retransmit. If a particular ack comes 
+ 	back for a packet 4 times (which is three duplicate ACKs), then the serverwill execute a fast 
+ 	retransmit for that packet.
+  
+  -Max Retransmit:
+ 	Additionally, there is a counter for the number of times that a packet is sent. If a packet is sent 
+ 	more than the maximum retransmit times, the connection is deemed terminated, and the server ceases
+ 	to attempt to send packets to the client.
+  
+  -Last Packet:
+    To handle the last packet we added a value in the packet header to indicate the last packet is sent.
+
+  -Clean Closeing / Time Wait:
+  	When the client gets the last packet, it sets a timer on its next receive call. If 5 seconds pass 
+  	without the client receiving anything else, the client will exit, as this shows the server has 
+  	received the client's ACK for the FIN packet.
+  	The server can close the connection with the client as soon as it receives an ACK from all packets.
+  	
+
+ B: Flow Control:
+ 	Our implemention of flow control uses the receive_window that is sent by the client to the server
+ 	with the initial connection setup (file request) message, and with every ACK.
+
+  -Receive Window Flow Control:
+ 	This window value is updated and checked upon each message send to ensure that the server will 
+ 	not overflow the clients receive window. 
+
+  -Window Lock State:
+ 	Furthermore, if the client's receive window does fill, and there is a window lock,
+ 	the server will timeout and send a probing packet. This probing packet is a zero byte packet with
+ 	the sequence number of zero (0). Upon receiving this packet, the client will simply send an ACK, 
+ 	along with the new window size, to the server. We can be sure this packet will only result in an 
+ 	ACK being sent and not read in as data since the sequence number zero (0) is used in the connection
+ 	setup phase, and the first data packet will have sequence number one (1).
+
+
+ C: Congestion Control:
+ 	The congestion control mechanism is implemented as Additive Increase Multiplicative Decrease with
+ 	Slow Start. ADIM is implemented by manipulating the congestion window, which is used as the limit for
+ 	the number of packets that can be in flight at any given time. 
+
+  -Additive Increase:
+  	Upon a packet being acknowledged the congestion window is increased by 1 if under the 
+  	Slow Start Threshold, or by 1/n (where n is the current value of congestion window) if at or over 
+  	the Slow Start Threshold.
+
+  -Multiplicative Decrease:
+  	There are two occurances where the congestion window will decrease. This occurs when there is a 
+  	timeout and when there are three duplicate acks, known as fast retransmit.
+  	1: In the case of a timeout, the congestion window drops to 1, and the threshold is set to half
+  	   of the congestion window's previous value.
+  	2: In the case of fast retransmit, the congestion window drops to half the current value,
+  	   and the slow start threshold is also set to this value.
+
+
+
